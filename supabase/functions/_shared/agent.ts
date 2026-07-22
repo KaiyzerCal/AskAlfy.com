@@ -1,14 +1,17 @@
 // alfy-agent — the brain. Anthropic tool-use loop, forked from Prymal's prymal-chat.
 // Invariant that mirrors the brand ("Alfy asks first"): the agent NEVER sends or acts
-// externally. Reads are direct (Gmail/Calendar REST via _shared/google.ts); anything
-// outbound is queued via a dedicated action tool (or queue_action as a fallback) and
-// only executed after approval (see alfy-approve).
+// externally on its own judgment. Reads are direct (Gmail/Calendar REST via
+// _shared/google.ts); anything outbound is queued via a dedicated action tool (or
+// queue_action as a fallback) and only executed after a yes — either a fresh tap on
+// Approve (alfy-approve), or a standing permission granted earlier for that exact
+// action_type (queue(), below — the yes already happened, it's just durable now).
 //
 // Lives here rather than in supabase/functions/alfy-agent/index.ts so alfy-sms-inbound
 // can import it without relying on Supabase's per-folder function bundling.
 
 import Anthropic from 'npm:@anthropic-ai/sdk';
 import { createClient } from 'npm:@supabase/supabase-js';
+import { executeAction } from './executors.ts';
 import {
 	calendarGetAvailability,
 	calendarListEvents,
@@ -38,7 +41,17 @@ RULES — never break these:
    matching action tool (send_email, create_event, ...) — or queue_action if there's no
    dedicated tool yet. It waits for their yes in the dashboard; they get a link to approve.
 3. Draft in the person's voice using their context. If you lack something you need, ask.
-4. Be specific: say what you found, what you drafted, and that it's waiting for their yes.`;
+4. Be specific: say what you found, what you drafted, and that it's waiting for their yes.
+5. If a tool result comes back already done (auto: true), a standing permission covered it —
+   report it the same as any other completed action, don't ask again, that yes already
+   happened.
+6. get_context's autonomy_candidates lists things the person has approved several times with
+   no standing permission yet. You may offer — plainly, no pressure, at most one candidate
+   per reply — to stop asking for that one specific thing. Only call
+   grant_standing_permission after they clearly say yes in this same exchange; never propose
+   and grant in the same turn without an answer. Each text starts fresh with no memory of
+   earlier ones, so don't lean on this — mention it lightly when it's naturally relevant,
+   don't turn it into a recurring pitch.`;
 
 const TOOLS: Anthropic.Tool[] = [
 	{
@@ -483,6 +496,18 @@ const TOOLS: Anthropic.Tool[] = [
 		input_schema: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] },
 	},
 	{
+		name: 'grant_standing_permission',
+		description: 'Turn a repeated approval into a standing okay so Alfy stops asking for that one specific kind of action and just does it, still confirming after. Only call this after the person clearly says yes to an offer — never propose and grant in the same turn without their answer.',
+		input_schema: {
+			type: 'object',
+			properties: {
+				action_type: { type: 'string', description: 'The action_type from get_context\'s autonomy_candidates, e.g. "create_task"' },
+				description: { type: 'string', description: 'Plain line for the dashboard Trust list, e.g. "Adds tasks you ask for without checking first"' },
+			},
+			required: ['action_type', 'description'],
+		},
+	},
+	{
 		name: 'queue_action',
 		description: "Queue an outbound action with no dedicated tool yet, for the person to approve. Nothing happens until they say yes.",
 		input_schema: {
@@ -510,6 +535,47 @@ async function queue(
 	userId: string,
 	args: { kind: string; summary: string; draft_content?: string | null; action_type: string; action_payload: Record<string, unknown> },
 ) {
+	// A standing permission already covers this exact action_type — that yes already
+	// happened, so execute now instead of queueing. Still logged in approval_queue (as
+	// 'executed', tagged with the permission) so it shows up in Handled and in digests the
+	// same as anything else, and still confirmed in the reply — the ask goes away, the
+	// transparency doesn't.
+	const { data: permission } = await supa
+		.from('standing_permissions')
+		.select('id')
+		.eq('user_id', userId)
+		.eq('action_type', args.action_type)
+		.is('revoked_at', null)
+		.maybeSingle();
+
+	if (permission) {
+		const { data, error } = await supa.from('approval_queue').insert({
+			user_id: userId,
+			kind: args.kind,
+			summary: args.summary,
+			draft_content: args.draft_content ?? null,
+			action_type: args.action_type,
+			action_payload: args.action_payload,
+			status: 'approved',
+			standing_permission_id: permission.id,
+			decided_at: new Date().toISOString(),
+		}).select('id').single();
+		if (error) throw new Error(error.message);
+
+		try {
+			const { confirmationText } = await executeAction(supa, userId, args.action_type, args.action_payload, args.draft_content ?? null);
+			await supa.from('approval_queue').update({
+				status: 'executed',
+				executed_at: new Date().toISOString(),
+				undo_until: new Date(Date.now() + 10 * 60_000).toISOString(),
+			}).eq('id', data?.id);
+			return { executed: true, auto: true, confirmation: confirmationText ?? `Done — ${args.summary}.` };
+		} catch (err) {
+			await supa.from('approval_queue').update({ status: 'failed' }).eq('id', data?.id);
+			throw err;
+		}
+	}
+
 	const { data, error } = await supa.from('approval_queue').insert({
 		user_id: userId,
 		kind: args.kind,
@@ -526,12 +592,31 @@ async function queue(
 async function handleTool(name: string, input: Record<string, unknown>, supa: ReturnType<typeof createClient>, userId: string) {
 	switch (name) {
 		case 'get_context': {
-			const [{ data: user }, { data: people }, { data: perms }] = await Promise.all([
+			const thirtyDaysAgo = new Date(Date.now() - 30 * 864e5).toISOString();
+			const [{ data: user }, { data: people }, { data: perms }, { data: recentDecided }] = await Promise.all([
 				supa.from('users').select('display_name, about, timezone').eq('id', userId).single(),
 				supa.from('people').select('name, context_summary').eq('user_id', userId),
 				supa.from('standing_permissions').select('description, action_type').eq('user_id', userId).is('revoked_at', null),
+				supa.from('approval_queue').select('action_type, kind, summary')
+					.eq('user_id', userId).in('status', ['approved', 'executed']).is('standing_permission_id', null)
+					.gte('decided_at', thirtyDaysAgo),
 			]);
-			return { user, people: people ?? [], standing_okays: perms ?? [] };
+
+			// Things approved 3+ times in the last 30 days with no standing permission yet —
+			// candidates the model may offer to stop asking about (system prompt rule 6).
+			const grantedTypes = new Set((perms ?? []).map((p) => p.action_type));
+			const counts = new Map<string, { count: number; kind: string; example: string }>();
+			for (const row of recentDecided ?? []) {
+				if (grantedTypes.has(row.action_type)) continue;
+				const entry = counts.get(row.action_type) ?? { count: 0, kind: row.kind, example: row.summary };
+				entry.count += 1;
+				counts.set(row.action_type, entry);
+			}
+			const autonomy_candidates = [...counts.entries()]
+				.filter(([, v]) => v.count >= 3)
+				.map(([action_type, v]) => ({ action_type, kind: v.kind, times_approved: v.count, example: v.example }));
+
+			return { user, people: people ?? [], standing_okays: perms ?? [], autonomy_candidates };
 		}
 		case 'get_emails': {
 			const token = await getFreshToken(supa, userId, 'gmail');
@@ -890,6 +975,15 @@ async function handleTool(name: string, input: Record<string, unknown>, supa: Re
 				.eq('user_id', userId);
 			if (error) throw new Error(error.message);
 			return { cancelled: true };
+		}
+		case 'grant_standing_permission': {
+			const { data, error } = await supa.from('standing_permissions').insert({
+				user_id: userId,
+				action_type: input.action_type,
+				description: input.description,
+			}).select('id').single();
+			if (error) throw new Error(error.message);
+			return { granted: true, id: data?.id };
 		}
 		case 'queue_action':
 			return await queue(supa, userId, {

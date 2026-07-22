@@ -10,7 +10,7 @@
 
 ### What's already done (don't rebuild it)
 Marketing site, the 3-tab dashboard (Today / Handled / Alfy knows), phone-OTP login, the
-`/a` magic-link handler, the DB schema (`supabase/migrations/0001`-`0006_*.sql`, applied to
+`/a` magic-link handler, the DB schema (`supabase/migrations/0001`-`0007_*.sql`, applied to
 the live `askalfy` Supabase project), and nine edge functions (`supabase/functions/alfy-*`,
 sharing logic via `supabase/functions/_shared/`). It runs on demo data right now with zero
 setup.
@@ -41,7 +41,7 @@ supabase secrets set SUPABASE_URL=... SUPABASE_ANON_KEY=... SUPABASE_SERVICE_ROL
   TWILIO_ACCOUNT_SID=... TWILIO_AUTH_TOKEN=... TWILIO_PHONE_NUMBER=... \
   INTERNAL_FUNCTION_SECRET=...   # must match the secret baked into the live cron.schedule() call, see docs/alfy-handoff.md \
   STRIPE_SECRET_KEY=... STRIPE_WEBHOOK_SECRET=... STRIPE_PRICE_ALFY=... STRIPE_PRICE_ALFY_PLUS=...
-supabase functions deploy alfy-agent alfy-sms-inbound alfy-link alfy-approve alfy-connect alfy-automation-runner alfy-stripe-checkout alfy-stripe-webhook
+supabase functions deploy alfy-agent alfy-sms-inbound alfy-link alfy-approve alfy-connect alfy-automation-runner alfy-digest alfy-stripe-checkout alfy-stripe-webhook
 ```
 Then:
 - **Supabase → Auth → Providers → Phone → Twilio** (so login codes send).

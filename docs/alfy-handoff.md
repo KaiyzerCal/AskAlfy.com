@@ -62,7 +62,7 @@ via that synthetic email. Both resolve to the same account.
    applied to it.
 2. **Set function secrets** (see `.env.local.example` list) via `supabase secrets set` —
    `GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET` are new; `COMPOSIO_*` are no longer needed.
-3. **Deploy functions:** `supabase functions deploy alfy-agent alfy-sms-inbound alfy-link alfy-approve alfy-connect alfy-automation-runner alfy-stripe-checkout alfy-stripe-webhook`.
+3. **Deploy functions:** `supabase functions deploy alfy-agent alfy-sms-inbound alfy-link alfy-approve alfy-connect alfy-automation-runner alfy-digest alfy-stripe-checkout alfy-stripe-webhook`.
 4. **Google Cloud OAuth client:** create a Web application OAuth client, register redirect
    URI `${PUBLIC_APP_URL}/auth/google-callback`, put the client ID (also hardcode in
    `src/lib/config.ts`'s `GOOGLE_CLIENT_ID`) and secret in Supabase function secrets.
@@ -99,6 +99,16 @@ actions specifically, connect Google first from Settings → Connections.
       `checkout.session.completed`, `customer.subscription.created/updated/deleted`, copy its
       signing secret into `STRIPE_WEBHOOK_SECRET`. None of `alfy-stripe-checkout`/
       `alfy-stripe-webhook`'s live calls have hit a real Stripe account yet.
+- [ ] **`alfy-digest`** — the cron job (hourly, `:10`) is registered live using the same
+      `x-runner-key` secret as automation-runner, so it needs the same
+      `INTERNAL_FUNCTION_SECRET` above to actually authenticate. Once real Twilio/Anthropic/
+      Google credentials exist, confirm a morning brief and evening debrief actually land —
+      the local-time window math (`getLocalParts`/`zonedTimeToUtc` in `alfy-digest/index.ts`)
+      hasn't been checked against a real `users.timezone` value yet.
+- [ ] **Standing-permission auto-execute** — `_shared/agent.ts`'s `queue()` auto-execute
+      branch and `grant_standing_permission` haven't fired against a live Google account
+      yet; confirm a granted permission actually skips the ask and executes on the next
+      matching action, with the confirmation text landing in the same reply.
 
 (Session mint in `alfy-link` is resolved — documented `generateLink` + `verifyOtp` pattern.
 Composio's connect/tool-execute calls are no longer part of this path — see the Phase 1
@@ -204,8 +214,45 @@ countdown in plain days-left language (no raw action-count exposed, matching Pal
 "generous allowances" framing over a scary counter), or the current plan name, with a
 marigold "Upgrade"/"Reactivate" button or a plain "Manage" link depending on state.
 
+**Phase 6 update:** the closed loop — morning brief through evening debrief — plus live
+graduated autonomy, per Chris's product direction (repeated approvals should be able to earn
+Alfy more autonomy over time, not stay a permanent ask-every-time loop).
+
+- **Standing permissions are now live**, not just a revoke-only list in the dashboard.
+  `_shared/executors.ts` is a new module — the `action_type → real Google API call` switch
+  extracted out of `alfy-approve` — so both the human-tap path and a new auto-execute path
+  can replay the exact same executors. `_shared/agent.ts`'s `queue()` now checks for an
+  active `standing_permissions` row for the exact `action_type` before inserting a pending
+  approval; if one exists, it executes immediately (still logged in `approval_queue` as
+  `executed`, tagged with `standing_permission_id`, still confirmed in the reply) instead of
+  waiting on a tap. The "ask first" invariant isn't broken — the yes already happened, once,
+  when the permission was granted; it's just durable now instead of per-action.
+- **`get_context` gained `autonomy_candidates`**: `action_type`s approved 3+ times in the
+  last 30 days with no standing permission yet. A new `grant_standing_permission` tool lets
+  the model turn one into a live permission, but only after the person clearly says yes in
+  that same exchange (system prompt rule 6) — it may offer, once per reply, never nag, and
+  has no memory of a declined offer across separate texts (each SMS turn is still stateless
+  by design, see `alfy-sms-inbound`'s `runAgent` call passing no history).
+- **`alfy-digest`** (new function, `pg_cron` hourly, same shared-secret pattern as
+  `alfy-automation-runner`) sends a morning brief and an evening debrief, both built
+  deterministically from the DB — no extra Claude call, since a fixed-shape summary doesn't
+  need one. Morning: what's pending, what standing instructions are being watched, today's
+  calendar. Evening: what got handled today (including auto-executed standing-permission
+  items), what's still waiting. Windows are computed in each person's own `users.timezone`
+  (a from-scratch local-day/local-hour implementation, since Deno has no timezone library),
+  checked every hour rather than scheduled per-timezone, with `last_brief_sent_date`/
+  `last_debrief_sent_date` (`0007_digest.sql`) deduping across the ~3 hourly ticks inside
+  each window. Respects the person's own quiet-hours setting and the billing gate — no
+  proactive text to a blocked account.
+- Cron registration (same live-only, not-committed-to-git pattern as Phase 4's automation
+  cron — see `0005_automation_cron.sql`'s comment): a second `cron.schedule()` call,
+  `alfy-digest-hourly` at `10 * * * *` (offset from automation-runner's `5 * * * *`),
+  reusing the same `x-runner-key` secret value already registered for automation-runner —
+  `INTERNAL_FUNCTION_SECRET` is one shared secret across both scheduled functions.
+
 **Not built yet:** nothing from the reference doc's roadmap remains. Slides/Forms/Keep were
-judged niche and skipped per the reference doc's own call.
+judged niche and skipped per the reference doc's own call. Chris's morning-brief/evening-
+debrief + graduated-autonomy direction (Phase 6, above) is now built too.
 
 ---
 
