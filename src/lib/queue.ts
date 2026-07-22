@@ -1,4 +1,5 @@
 import { supabase } from './supabase';
+import { GOOGLE_CLIENT_ID, GOOGLE_SCOPES } from './config';
 
 // Data layer for the dashboard's three tabs. Reads Supabase when configured;
 // falls back to demo data so a fresh fork renders with zero setup.
@@ -81,11 +82,71 @@ export async function skipItem(id: string | number): Promise<void> {
 	await supabase.from('approval_queue').update({ status: 'skipped', decided_at: new Date().toISOString() }).eq('id', id);
 }
 
-// Kicks off a Composio OAuth connect (Gmail/Calendar) and redirects to the consent screen.
-export async function connectProvider(provider: string): Promise<void> {
+// Builds the Google consent-screen URL client-side (GOOGLE_CLIENT_ID is public) and
+// redirects straight to it, asking for every scope Alfy's tools use in one screen. The
+// callback page (/auth/google-callback) hands the returned code to alfy-connect, which
+// does the actual token exchange.
+export function connectGoogle(): void {
+	const redirectUri = `${window.location.origin}/auth/google-callback`;
+	const params = new URLSearchParams({
+		client_id: GOOGLE_CLIENT_ID,
+		redirect_uri: redirectUri,
+		response_type: 'code',
+		scope: GOOGLE_SCOPES.join(' '),
+		access_type: 'offline',
+		prompt: 'consent',
+		state: 'google',
+	});
+	window.location.href = `https://accounts.google.com/o/oauth2/v2/auth?${params}`;
+}
+
+export interface PersonItem {
+	id: string | number;
+	name: string;
+	note: string;
+}
+
+export interface TrustItem {
+	id: string | number;
+	line: string;
+	since: string;
+}
+
+export const DEMO_PEOPLE: PersonItem[] = [
+	{ id: 1, name: 'Sam', note: 'Your brother. Prefers texts. Owes you $40.' },
+	{ id: 2, name: 'Dana', note: 'Coworker. Prefers email, mornings only.' },
+	{ id: 3, name: 'Mom', note: 'Birthday June 14. Likes lilies, not roses.' },
+];
+
+export const DEMO_TRUST: TrustItem[] = [
+	{ id: 1, line: 'Sends calendar replies without asking', since: 'you granted this Jan 12' },
+	{ id: 2, line: 'Pays the wifi bill each month', since: 'you granted this Feb 3' },
+];
+
+export async function loadPeople(): Promise<PersonItem[]> {
+	if (!supabase) return DEMO_PEOPLE;
+	const { data } = await supabase.from('people').select('id, name, context_summary').order('updated_at', { ascending: false });
+	return (data ?? []).map((r) => ({ id: r.id, name: r.name, note: r.context_summary ?? '' }));
+}
+
+function grantedLabel(iso: string): string {
+	const d = new Date(iso);
+	return `you granted this ${d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`;
+}
+
+export async function loadTrust(): Promise<TrustItem[]> {
+	if (!supabase) return DEMO_TRUST;
+	const { data } = await supabase
+		.from('standing_permissions')
+		.select('id, description, granted_at')
+		.is('revoked_at', null)
+		.order('granted_at', { ascending: false });
+	return (data ?? []).map((r) => ({ id: r.id, line: r.description, since: grantedLabel(r.granted_at) }));
+}
+
+export async function revokeTrust(id: string | number): Promise<void> {
 	if (!supabase) return;
-	const { data } = await supabase.functions.invoke('alfy-connect', { body: { provider } });
-	if (data?.redirect_url) window.location.href = data.redirect_url;
+	await supabase.from('standing_permissions').update({ revoked_at: new Date().toISOString() }).eq('id', id);
 }
 
 export interface Breakdown {
@@ -94,6 +155,29 @@ export interface Breakdown {
 	approved: number;
 	standing: number;
 	hoursSaved: number;
+}
+
+export interface BillingStatus {
+	plan: 'trial' | 'active' | 'plus' | 'past_due' | 'canceled';
+	trialEndsAt: string | null;
+}
+
+// null in demo mode (no Supabase configured) or if the row can't be read — callers fall
+// back to the same static "manage" placeholder the Settings panel always showed pre-Stripe.
+export async function loadBilling(): Promise<BillingStatus | null> {
+	if (!supabase) return null;
+	const { data } = await supabase.from('users').select('plan, trial_ends_at').single();
+	if (!data) return null;
+	return { plan: data.plan, trialEndsAt: data.trial_ends_at };
+}
+
+// One button, two jobs: alfy-stripe-checkout decides server-side whether this account needs
+// a Checkout Session (trial/past_due/canceled) or a Billing Portal session (already
+// active/plus) — the dashboard doesn't need to know which before redirecting.
+export async function startCheckout(plan: 'active' | 'plus' = 'active'): Promise<void> {
+	if (!supabase) return;
+	const { data } = await supabase.functions.invoke('alfy-stripe-checkout', { body: { plan } });
+	if (data?.url) window.location.href = data.url;
 }
 
 export function breakdown(items: HandledItem[]): Breakdown {

@@ -1,69 +1,79 @@
-// alfy-connect — starts a Composio connection for Gmail/Calendar and returns the redirect URL.
-// Uses a CUSTOM auth config (Alfy owns the OAuth app → tokens belong to Alfy, not Composio-managed).
-// Called from Settings → Connections with the user's JWT.
+// alfy-connect — exchanges a Google OAuth authorization code for tokens and marks the
+// connection active. The consent-screen redirect is built client-side
+// (src/lib/queue.ts's connectGoogle, since GOOGLE_CLIENT_ID is public) — this
+// function only ever sees the `code` Google hands back on the callback page.
+// Replaces the previous Composio connected_accounts/link flow.
 //
-// VERIFY before prod: the /v3/connected_accounts/link body shape + the per-provider
-// auth_config_id (created once in the Composio dashboard, supplied via secrets).
+// One consent screen grants scopes for Gmail, Calendar, Tasks, Drive, Docs, and Sheets at
+// once (see src/lib/config.ts's GOOGLE_SCOPES) — the resulting access/refresh token pair is
+// valid for all of them, so it's stored under every platform row _shared/google.ts's
+// getFreshToken looks up by, rather than requiring six separate connect flows.
 
 import { createClient } from 'npm:@supabase/supabase-js';
+import { corsHeaders } from '../_shared/cors.ts';
 
 const SUPABASE_URL = Deno.env.get('SUPABASE_URL')!;
 const SUPABASE_SERVICE_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
 const SUPABASE_ANON_KEY = Deno.env.get('SUPABASE_ANON_KEY')!;
-const COMPOSIO_API_KEY = Deno.env.get('COMPOSIO_API_KEY')!;
-const COMPOSIO_BASE = 'https://backend.composio.dev';
-const APP_URL = Deno.env.get('PUBLIC_APP_URL') ?? 'https://askalfy.com';
+const GOOGLE_CLIENT_ID = Deno.env.get('GOOGLE_CLIENT_ID')!;
+const GOOGLE_CLIENT_SECRET = Deno.env.get('GOOGLE_CLIENT_SECRET')!;
 
-// provider → the Composio auth_config_id you create once in their dashboard.
-const AUTH_CONFIG: Record<string, string | undefined> = {
-	gmail: Deno.env.get('COMPOSIO_AUTHCFG_GMAIL'),
-	googlecalendar: Deno.env.get('COMPOSIO_AUTHCFG_CALENDAR'),
-};
-
-const CORS = {
-	'Access-Control-Allow-Origin': '*',
-	'Access-Control-Allow-Headers': 'authorization, content-type',
-	'Access-Control-Allow-Methods': 'POST, OPTIONS',
-};
+const GOOGLE_PLATFORMS = ['gmail', 'calendar', 'tasks', 'drive', 'docs', 'sheets'];
 
 Deno.serve(async (req) => {
-	if (req.method === 'OPTIONS') return new Response(null, { headers: CORS });
+	const cors = corsHeaders(req);
+	if (req.method === 'OPTIONS') return new Response(null, { headers: cors });
 
 	const auth = req.headers.get('Authorization');
-	if (!auth) return new Response(JSON.stringify({ error: 'unauthorized' }), { status: 401, headers: CORS });
+	if (!auth) return new Response(JSON.stringify({ error: 'unauthorized' }), { status: 401, headers: cors });
 
 	// Identify the user from their session.
 	const anon = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 	const { data: { user } } = await anon.auth.getUser(auth.replace('Bearer ', ''));
-	if (!user) return new Response(JSON.stringify({ error: 'unauthorized' }), { status: 401, headers: CORS });
+	if (!user) return new Response(JSON.stringify({ error: 'unauthorized' }), { status: 401, headers: cors });
 
 	const supa = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 	const { data: acct } = await supa.from('users').select('id').eq('auth_user_id', user.id).single();
-	if (!acct) return new Response(JSON.stringify({ error: 'no account' }), { status: 404, headers: CORS });
+	if (!acct) return new Response(JSON.stringify({ error: 'no account' }), { status: 404, headers: cors });
 
-	const { provider } = await req.json();
-	const authConfigId = AUTH_CONFIG[provider];
-	if (!authConfigId) return new Response(JSON.stringify({ error: `no auth config for ${provider}` }), { status: 400, headers: CORS });
+	const { code, redirect_uri } = await req.json();
+	if (!code || !redirect_uri) return new Response(JSON.stringify({ error: 'missing code or redirect_uri' }), { status: 400, headers: cors });
 
-	// Current (non-deprecated) endpoint for Composio-managed OAuth connect links.
-	const res = await fetch(`${COMPOSIO_BASE}/api/v3/connected_accounts/link`, {
+	const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
 		method: 'POST',
-		headers: { 'x-api-key': COMPOSIO_API_KEY, 'Content-Type': 'application/json' },
-		body: JSON.stringify({
-			user_id: acct.id,
-			auth_config_id: authConfigId,
-			callback_url: `${APP_URL}/app?connected=${provider}`,
+		headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+		body: new URLSearchParams({
+			code,
+			client_id: GOOGLE_CLIENT_ID,
+			client_secret: GOOGLE_CLIENT_SECRET,
+			redirect_uri,
+			grant_type: 'authorization_code',
 		}),
 	});
-	const data = await res.json();
+	const tokens = await tokenRes.json();
+	if (!tokens.access_token) {
+		return new Response(JSON.stringify({ error: 'token exchange failed', details: tokens }), { status: 400, headers: cors });
+	}
 
-	// Record intent; status flips to active on callback.
-	await supa.from('connections').upsert(
-		{ user_id: acct.id, provider, composio_connection_id: data.id ?? null, status: 'pending' },
-		{ onConflict: 'user_id,provider' }
+	const expiresAt = new Date(Date.now() + (tokens.expires_in ?? 3600) * 1000).toISOString();
+	const now = new Date().toISOString();
+
+	await supa.from('oauth_tokens').upsert(
+		GOOGLE_PLATFORMS.map((platform) => ({
+			user_id: acct.id,
+			platform,
+			access_token: tokens.access_token,
+			refresh_token: tokens.refresh_token,
+			expires_at: expiresAt,
+			updated_at: now,
+		})),
+		{ onConflict: 'user_id,platform' },
 	);
 
-	return new Response(JSON.stringify({ redirect_url: data.redirect_url ?? data.redirectUrl }), {
-		headers: { 'Content-Type': 'application/json', ...CORS },
-	});
+	await supa.from('connections').upsert(
+		{ user_id: acct.id, provider: 'google', status: 'active', connected_at: now },
+		{ onConflict: 'user_id,provider' },
+	);
+
+	return new Response(JSON.stringify({ success: true, provider: 'google' }), { headers: { 'Content-Type': 'application/json', ...cors } });
 });

@@ -2,15 +2,25 @@ import { useEffect, useState } from 'react';
 import {
 	DEMO_QUEUE,
 	DEMO_HANDLED,
+	DEMO_PEOPLE,
+	DEMO_TRUST,
 	loadToday,
 	loadHandled,
+	loadPeople,
+	loadTrust,
+	revokeTrust,
 	approveItem,
 	skipItem,
-	connectProvider,
+	connectGoogle,
+	loadBilling,
+	startCheckout,
 	breakdown,
 	type QueueItem,
 	type HandledItem,
+	type PersonItem,
+	type TrustItem,
 	type Range,
+	type BillingStatus,
 } from '../lib/queue';
 
 // Reads Supabase when configured (src/lib/supabase.ts); otherwise renders demo data.
@@ -22,20 +32,21 @@ const WATCHING = [
 	'Airline refund from March — checking daily, day 6',
 ];
 
-const PEOPLE = [
-	{ name: 'Sam', note: 'Your brother. Prefers texts. Owes you $40.' },
-	{ name: 'Dana', note: 'Coworker. Prefers email, mornings only.' },
-	{ name: 'Mom', note: 'Birthday June 14. Likes lilies, not roses.' },
-];
-
-const TRUST = [
-	{ line: 'Sends calendar replies without asking', since: 'you granted this Jan 12' },
-	{ line: 'Pays the wifi bill each month', since: 'you granted this Feb 3' },
-];
-
 const reduceMotion =
 	typeof window !== 'undefined' &&
 	window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+function trialDaysLeft(trialEndsAt: string): number {
+	return Math.max(0, Math.ceil((new Date(trialEndsAt).getTime() - Date.now()) / 86_400_000));
+}
+
+const PLAN_LABEL: Record<BillingStatus['plan'], string> = {
+	trial: 'Free trial',
+	active: 'Alfy — $25/mo',
+	plus: 'Alfy Plus — $75/mo',
+	past_due: 'Your plan needs attention',
+	canceled: 'Your plan ended',
+};
 
 const tabClass = (active: boolean) =>
 	`cursor-pointer px-4 py-2.5 text-small font-medium -mb-px border-b-2 transition-colors ${
@@ -135,6 +146,9 @@ export default function AlfyDashboard() {
 	const [queue, setQueue] = useState<QueueItem[]>(DEMO_QUEUE);
 	const [handled, setHandled] = useState<HandledItem[]>(DEMO_HANDLED);
 	const [range, setRange] = useState<Range>('week');
+	const [people, setPeople] = useState<PersonItem[]>(DEMO_PEOPLE);
+	const [trust, setTrust] = useState<TrustItem[]>(DEMO_TRUST);
+	const [billing, setBilling] = useState<BillingStatus | null>(null);
 
 	// Hydrate from Supabase when it's configured; demo data shows until then.
 	useEffect(() => {
@@ -143,6 +157,18 @@ export default function AlfyDashboard() {
 	useEffect(() => {
 		loadHandled(range).then(setHandled);
 	}, [range]);
+	useEffect(() => {
+		loadPeople().then(setPeople);
+		loadTrust().then(setTrust);
+	}, []);
+	useEffect(() => {
+		loadBilling().then(setBilling);
+	}, []);
+
+	function handleRevokeTrust(id: string | number) {
+		setTrust((t) => t.filter((i) => i.id !== id));
+		void revokeTrust(id);
+	}
 
 	function handleApprove(item: QueueItem) {
 		setQueue((q) => q.filter((i) => i.id !== item.id));
@@ -354,8 +380,8 @@ export default function AlfyDashboard() {
 						<div className="rounded-3xl border border-hairline bg-card p-6 shadow-[0_8px_30px_-12px_rgba(46,42,36,0.12)]">
 							<p className="label-caps text-muted">People</p>
 							<ul className="mt-3 divide-y divide-hairline">
-								{PEOPLE.map((p) => (
-									<li key={p.name} className="flex items-baseline justify-between gap-4 py-3">
+								{people.map((p) => (
+									<li key={p.id} className="flex items-baseline justify-between gap-4 py-3">
 										<p className="text-body text-espresso">
 											<span className="font-medium">{p.name}</span>
 											<span className="text-secondary"> — {p.note}</span>
@@ -374,12 +400,13 @@ export default function AlfyDashboard() {
 						<div className="rounded-3xl border border-fern/20 bg-fern-tint/40 p-6">
 							<p className="label-caps text-fern">Trust</p>
 							<ul className="mt-3 space-y-3">
-								{TRUST.map((t) => (
-									<li key={t.line} className="text-body text-espresso">
+								{trust.map((t) => (
+									<li key={t.id} className="text-body text-espresso">
 										{t.line}
 										<span className="text-secondary"> — {t.since} · </span>
 										<button
 											type="button"
+											onClick={() => handleRevokeTrust(t.id)}
 											className="cursor-pointer text-small font-medium text-fern underline decoration-fern/40 underline-offset-4 hover:text-espresso"
 										>
 											revoke
@@ -416,15 +443,44 @@ export default function AlfyDashboard() {
 								<span className="text-espresso">Connections</span>
 								<button
 									type="button"
-									onClick={() => connectProvider('gmail')}
+									onClick={() => connectGoogle()}
 									className="cursor-pointer text-small font-medium text-fern underline decoration-fern/40 underline-offset-4 hover:text-espresso"
 								>
 									Connect Google
 								</button>
 							</li>
 							<li className="flex items-center justify-between py-3">
-								<span className="text-espresso">Billing</span>
-								<span className="text-small text-secondary">manage</span>
+								<div>
+									<span className="text-espresso">Billing</span>
+									{billing && (
+										<p className="text-small text-muted">
+											{billing.plan === 'trial' && billing.trialEndsAt
+												? `${trialDaysLeft(billing.trialEndsAt)} day${trialDaysLeft(billing.trialEndsAt) === 1 ? '' : 's'} left in your free trial`
+												: PLAN_LABEL[billing.plan]}
+										</p>
+									)}
+								</div>
+								{billing ? (
+									billing.plan === 'active' || billing.plan === 'plus' ? (
+										<button
+											type="button"
+											onClick={() => void startCheckout()}
+											className="cursor-pointer text-small font-medium text-secondary hover:text-espresso"
+										>
+											Manage
+										</button>
+									) : (
+										<button
+											type="button"
+											onClick={() => void startCheckout()}
+											className="min-h-9 cursor-pointer rounded-full bg-marigold px-4 text-small font-medium text-on-marigold transition-colors hover:bg-[#C97923]"
+										>
+											{billing.plan === 'past_due' || billing.plan === 'canceled' ? 'Reactivate' : 'Upgrade'}
+										</button>
+									)
+								) : (
+									<span className="text-small text-secondary">manage</span>
+								)}
 							</li>
 							<li className="flex items-center justify-between py-3">
 								<span className="text-espresso">Quiet hours</span>
