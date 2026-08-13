@@ -7,7 +7,7 @@ export const SMS_URI = `sms:${ALFY_PHONE}`;
 // lives only as an edge-function secret. Placeholder until a real GCP OAuth client is
 // created (see docs/alfy-handoff.md); the redirect URI to register there is
 // `${PUBLIC_APP_URL}/auth/google-callback`.
-export const GOOGLE_CLIENT_ID = 'REPLACE_WITH_REAL_GOOGLE_CLIENT_ID.apps.googleusercontent.com';
+export const GOOGLE_CLIENT_ID = '602381566088-s7dcq0m47u4dr623bvefvakn98c14dqr.apps.googleusercontent.com';
 
 // One "Connect Google" button asks for every scope Alfy's tools use in a single consent
 // screen, rather than a separate OAuth round-trip per Google app — simpler for an SMS-first

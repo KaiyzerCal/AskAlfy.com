@@ -27,3 +27,6 @@ pnpm-debug.log*
 
 # local screenshot artifacts
 .claude/screenshots/
+
+# Supabase CLI cache
+supabase/.temp/
